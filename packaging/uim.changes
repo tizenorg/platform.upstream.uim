@@ -1,0 +1,14 @@
+* Wed Sept 19 2012 Zheng, wu <wu.zheng@intel.com>
+- fix license in spec file
+
+* Tue Sept 11 2012 Zheng, wu <wu.zheng@intel.com>
+- Fix the bluetooth can't pair with the other device issue.
+
+* Fri Aug 31 2012 Patrick McCarty <patrick.mccarty@linux.intel.com> dbd7662
+- Repackage the sysvinit script and symlink
+
+* Tue Aug 07 2012 Patrick McCarty <patrick.mccarty@linux.intel.com> 3dab3d8
+- systemd: move the module loading to a new service file
+
+* Mon Aug 06 2012 Patrick McCarty <patrick.mccarty@linux.intel.com> 925f272
+- Add/install a systemd service file
