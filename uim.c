@@ -1,5 +1,5 @@
 /*
- *  User Mode Init manager - For shared transport
+ *  User Mode Init manager - For TI shared transport
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -15,40 +15,49 @@
  *  along with this program;if not, write to the Free Software
  *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
-
 #include <stdio.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <stdlib.h>
 #include <string.h>
 #include <signal.h>
-#include <time.h>
-#include <sys/time.h>
 #include <sys/ioctl.h>
 #include <termios.h>
 #include <poll.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
-#include <sys/types.h>
+#include "uim.h"
 #ifdef ANDROID
 #include <private/android_filesystem_config.h>
+#include <cutils/log.h>
 #endif
 
-#include "uim.h"
 
 /* Maintains the exit state of UIM*/
 static int exiting;
-#define UIM_DEBUG
-
-/* Maintains the exit state of UIM*/
-static int exiting;
-static int line_discipline;
-static int dev_fd;
 
 /* BD address as string and a pointer to array of hex bytes */
-char uim_bd_address[BD_ADDR_LEN+1];
+char uim_bd_address[17];
 bdaddr_t *bd_addr;
+
+/* File descriptor for the UART device*/
+int dev_fd;
+
+static inline void cleanup(int failed)
+{
+	/* for future use */
+	(void)failed;
+
+	if (dev_fd == -1)
+		return;
+
+	UIM_DBG("%s", __func__);
+
+	close(dev_fd);
+	dev_fd = -1;
+	/* unused failed for future reference */
+}
 
 /*****************************************************************************/
 #ifdef UIM_DEBUG
@@ -56,22 +65,72 @@ bdaddr_t *bd_addr;
  *  module into the system. Currently used for
  *  debugging purpose, whenever the baud rate is changed
  */
-void read_firmware_version(int dev_fd)
+void read_firmware_version()
 {
 	int index = 0;
 	char resp_buffer[20] = { 0 };
 	unsigned char buffer[] = { 0x01, 0x01, 0x10, 0x00 };
 
 	UIM_START_FUNC();
-	UIM_VER(" wrote %d bytes", (int) write(dev_fd, buffer, 4));
-	UIM_VER(" reading %d bytes", (int) read(dev_fd, resp_buffer, 15));
+	UIM_VER(" wrote %d bytes", (int)write(dev_fd, buffer, 4));
+	UIM_VER(" reading %d bytes", (int)read(dev_fd, resp_buffer, 15));
 
 	for (index = 0; index < 15; index++)
 		UIM_VER(" %x ", resp_buffer[index]);
 
 	printf("\n");
 }
-#endif
+#endif /* UIM_DEBUG */
+
+/*****************************************************************************/
+#ifdef ANDROID                 /* library for android to do insmod/rmmod  */
+
+/* Function to insert the kernel module into the system*/
+static int insmod(const char *filename, const char *args)
+{
+	void *module;
+	unsigned int size;
+	int ret = -1;
+
+	UIM_START_FUNC();
+
+	module = (void *)load_file(filename, &size);
+	if (!module)
+		return ret;
+
+	ret = init_module(module, size, args);
+	free(module);
+
+	return ret;
+}
+
+/* Function to remove the kernel module from the system*/
+static int rmmod(const char *modname)
+{
+	int ret = -1;
+	int maxtry = MAX_TRY;
+
+	UIM_START_FUNC();
+
+	/* Retry MAX_TRY number of times in case of
+	 * failure
+	 */
+	while (maxtry-- > 0) {
+		ret = delete_module(modname, O_NONBLOCK | O_EXCL);
+		if (ret < 0 && errno == EAGAIN)
+			sleep(1);
+		else
+			break;
+	}
+
+	/* Failed to remove the module
+	*/
+	if (ret != 0)
+		UIM_ERR("Unable to unload driver module \"%s\": %s",
+				modname, strerror(errno));
+	return ret;
+}
+#endif /* ANDROID */
 
 /*****************************************************************************/
 /* Function to read the HCI event from the given file descriptor
@@ -85,7 +144,7 @@ int read_hci_event(int fd, unsigned char *buf, int size)
 	int count = 0;
 	int reading = 1;
 	int rd_retry_count = 0;
-	struct timespec tm = { 0, 50 * 1000 * 1000 };
+	struct timespec tm = {0, 50*1000*1000};
 
 	UIM_START_FUNC();
 
@@ -147,7 +206,7 @@ static int read_command_complete(int fd, unsigned short opcode)
 	UIM_START_FUNC();
 
 	UIM_VER(" Command complete started");
-	if (read_hci_event(fd, (unsigned char *) &resp, sizeof(resp)) < 0) {
+	if (read_hci_event(fd, (unsigned char *)&resp, sizeof(resp)) < 0) {
 		UIM_ERR(" Invalid response");
 		return -1;
 	}
@@ -156,7 +215,7 @@ static int read_command_complete(int fd, unsigned short opcode)
 	if (resp.uart_prefix != HCI_EVENT_PKT) {
 		UIM_ERR
 			(" Error in response: not an event packet, but 0x%02x!",
-				resp.uart_prefix);
+			 resp.uart_prefix);
 		return -1;
 	}
 
@@ -165,7 +224,7 @@ static int read_command_complete(int fd, unsigned short opcode)
 		/* event must be event-complete */
 		UIM_ERR
 			(" Error in response: not a cmd-complete event,but 0x%02x!",
-				resp.hci_hdr.evt);
+			 resp.hci_hdr.evt);
 		return -1;
 	}
 
@@ -176,7 +235,7 @@ static int read_command_complete(int fd, unsigned short opcode)
 		return -1;
 	}
 
-	if (resp.cmd_complete.opcode != (unsigned short) opcode) {
+	if (resp.cmd_complete.opcode != (unsigned short)opcode) {
 		UIM_ERR(" Error in response: opcode is 0x%04x, not 0x%04x!",
 				resp.cmd_complete.opcode, opcode);
 		return -1;
@@ -192,10 +251,11 @@ static int read_command_complete(int fd, unsigned short opcode)
  * by making a call to this function.This function is also called before
  * making a call to set the custom baud rate
  */
-static int set_baud_rate(int dev_fd)
+static int set_baud_rate()
 {
-	UIM_START_FUNC();
 	struct termios ti;
+
+	UIM_START_FUNC();
 
 	tcflush(dev_fd, TCIOFLUSH);
 
@@ -233,21 +293,25 @@ static int set_baud_rate(int dev_fd)
  * The UART baud rate has already been
  * set to default value 115200 before calling this function.
  * The baud rate is then changed to custom baud rate by this function*/
-static int set_custom_baud_rate(int dev_fd, int baud_rate, int flow_ctrl)
+static int set_custom_baud_rate(int cust_baud_rate, unsigned char flow_ctrl)
 {
 	UIM_START_FUNC();
 
 	struct termios ti;
 	struct termios2 ti2;
 
-	/* Flush non-transmitted output data,
-	 * non-read input data or both*/
-	tcflush(dev_fd, TCIOFLUSH);
 	/* Get the attributes of UART */
 	if (tcgetattr(dev_fd, &ti) < 0) {
 		UIM_ERR(" Can't get port settings");
 		return -1;
 	}
+
+	UIM_VER(" Changing baud rate to %u, flow control to %u",
+			cust_baud_rate, flow_ctrl);
+
+	/* Flush non-transmitted output data,
+	 * non-read input data or both*/
+	tcflush(dev_fd, TCIOFLUSH);
 
 	/*Set the UART flow control */
 	if (flow_ctrl)
@@ -270,101 +334,103 @@ static int set_custom_baud_rate(int dev_fd, int baud_rate, int flow_ctrl)
 	ioctl(dev_fd, TCGETS2, &ti2);
 	ti2.c_cflag &= ~CBAUD;
 	ti2.c_cflag |= BOTHER;
-	ti2.c_ospeed = baud_rate;
+	ti2.c_ospeed = cust_baud_rate;
 	ioctl(dev_fd, TCSETS2, &ti2);
 
 	UIM_DBG(" set_custom_baud_rate() done");
 	return 0;
 }
 
-/* Function to configure the UART
- * on receiving a notification from the ST KIM driver to install the line
- * discipline, this function does UART configuration necessary for the STK
+/*
+ * Handling the Signals sent from the Kernel Init Manager.
+ * After receiving the indication from rfkill subsystem, configure the
+ * baud rate, flow control and Install the N_TI_WL line discipline
  */
 int st_uart_config(unsigned char install)
 {
-	int ldisc, len, fd, flow_ctrl;
-	unsigned char buf[UART_DEV_NAME_LEN+1];
-	uim_speed_change_cmd cmd;
-	char uart_dev_name[UART_DEV_NAME_LEN+1];
-	long cust_baud_rate;
+	int ldisc, len, fd;
+	unsigned char uart_dev_name[32];
+	unsigned char buf[32];
+	unsigned long cust_baud_rate;
+	unsigned int flow_ctrl;
 
+	uim_speed_change_cmd cmd;
 	uim_bdaddr_change_cmd addr_cmd;
 
 	UIM_START_FUNC();
 
 	if (install == '1') {
-		memset(buf, 0, UART_DEV_NAME_LEN+1);
+		UIM_DBG("install set to 1");
+		memset(buf, 0, 32);
 		fd = open(DEV_NAME_SYSFS, O_RDONLY);
 		if (fd < 0) {
 			UIM_ERR("Can't open %s", DEV_NAME_SYSFS);
 			return -1;
 		}
-		len = read(fd, buf, UART_DEV_NAME_LEN);
+		len = read(fd, buf, 32);
 		if (len < 0) {
 			UIM_ERR("read err (%s)", strerror(errno));
 			close(fd);
 			return len;
 		}
-		sscanf((const char *) buf, "%s", uart_dev_name);
+		sscanf((const char*)buf, "%s", uart_dev_name);
 		close(fd);
 
-		memset(buf, 0, UART_DEV_NAME_LEN+1);
+		memset(buf, 0, 32);
 		fd = open(BAUD_RATE_SYSFS, O_RDONLY);
 		if (fd < 0) {
 			UIM_ERR("Can't open %s", BAUD_RATE_SYSFS);
 			return -1;
 		}
-		len = read(fd, buf, UART_DEV_NAME_LEN);
+		len = read(fd, buf, 32);
 		if (len < 0) {
 			UIM_ERR("read err (%s)", strerror(errno));
 			close(fd);
 			return len;
 		}
 		close(fd);
-		sscanf((const char *) buf, "%ld", &cust_baud_rate);
+		sscanf((const char*)buf, "%ld", &cust_baud_rate);
 
-		memset(buf, 0, UART_DEV_NAME_LEN+1);
+		memset(buf, 0, 32);
 		fd = open(FLOW_CTRL_SYSFS, O_RDONLY);
 		if (fd < 0) {
 			UIM_ERR("Can't open %s", FLOW_CTRL_SYSFS);
-			/* As fd was not opened, it's not necessary to close it */
+			close(fd);
 			return -1;
 		}
-		len = read(fd, buf, UART_DEV_NAME_LEN);
+		len = read(fd, buf, 32);
 		if (len < 0) {
 			UIM_ERR("read err (%s)", strerror(errno));
 			close(fd);
 			return len;
 		}
 		close(fd);
-		sscanf((const char *) buf, "%d", &flow_ctrl);
+		sscanf((const char*)buf, "%u", &flow_ctrl);
 
-		UIM_VER(" signal received, opening %s", uart_dev_name);
-
-		dev_fd = open(uart_dev_name, O_RDWR);
-		if (dev_fd < 0) {
-			UIM_ERR("Can't open %s", uart_dev_name);
-			return -1;
+		if (dev_fd != -1) {
+			UIM_ERR("opening %s, while already open", uart_dev_name);
+			cleanup(-1);
 		}
 
-		UIM_VER(" Setting default baudrate");
-
+		dev_fd = open((const char*) uart_dev_name, O_RDWR);
+		if (dev_fd < 0) {
+			UIM_ERR(" Can't open %s", uart_dev_name);
+			return -1;
+		}
 		/*
 		 * Set only the default baud rate.
 		 * This will set the baud rate to default 115200
 		 */
-		if (set_baud_rate(dev_fd) < 0) {
-			UIM_ERR("set_baudrate() failed");
-			close(dev_fd);
+		if (set_baud_rate() < 0) {
+			UIM_ERR(" set_baudrate() failed");
+			cleanup(-1);
 			return -1;
 		}
 
-		fcntl(dev_fd, F_SETFL, fcntl(dev_fd, F_GETFL) | O_NONBLOCK);
-		/* Set only the custom baud rate */
+		fcntl(dev_fd, F_SETFL,fcntl(dev_fd, F_GETFL) | O_NONBLOCK);
+		/* Set only thecustom baud rate */
 		if (cust_baud_rate != 115200) {
 
-			UIM_VER("Setting speed to %ld", cust_baud_rate);
 			/* Forming the packet for Change speed command */
 			cmd.uart_prefix = HCI_COMMAND_PKT;
 			cmd.hci_hdr.opcode = HCI_HDR_OPCODE;
@@ -375,32 +441,31 @@ int st_uart_config(unsigned char install)
 			 * This will change the UART speed at the controller
 			 * side
 			 */
-			UIM_VER(" Setting speed to %d", cust_baud_rate);
+			UIM_VER(" Setting speed to %ld", cust_baud_rate);
 			len = write(dev_fd, &cmd, sizeof(cmd));
 			if (len < 0) {
-				UIM_ERR("Failed to write speed-set command");
-				close(dev_fd);
+				UIM_ERR(" Failed to write speed-set command");
+				cleanup(-1);
 				return -1;
 			}
 
 			/* Read the response for the Change speed command */
 			if (read_command_complete(dev_fd, HCI_HDR_OPCODE) < 0) {
-				close(dev_fd);
+				cleanup(-1);
 				return -1;
 			}
 
-			UIM_VER(" Speed changed to %d", cust_baud_rate);
+			UIM_VER(" Speed changed to %ld", cust_baud_rate);
 
 			/* Set the actual custom baud rate at the host side */
-			if (set_custom_baud_rate(dev_fd, cust_baud_rate, flow_ctrl) < 0) {
-				UIM_ERR("set_custom_baud_rate() failed");
-				close(dev_fd);
-
+			if (set_custom_baud_rate(cust_baud_rate, flow_ctrl) < 0) {
+				UIM_ERR(" set_custom_baud_rate() failed");
+				cleanup(-1);
 				return -1;
 			}
 
 			/* Set the uim BD address */
-			if (bd_addr) {
+			if (uim_bd_address[0] != 0) {
 
 				memset(&addr_cmd, 0, sizeof(addr_cmd));
 				/* Forming the packet for change BD address command*/
@@ -415,161 +480,317 @@ int st_uart_config(unsigned char install)
 				 */
 				len = write(dev_fd, &addr_cmd, sizeof(addr_cmd));
 				if (len < 0) {
-					UIM_ERR("Failed to write BD address command");
-					close(dev_fd);
+					UIM_ERR(" Failed to write BD address command");
+					cleanup(-1);
 					return -1;
 				}
 
 				/* Read the response for the change BD address command */
 				if (read_command_complete(dev_fd, WRITE_BD_ADDR_OPCODE) < 0) {
-					close(dev_fd);
+					cleanup(-1);
 					return -1;
 				}
-				UIM_VER("BD address changed to "
-						"%02X:%02X:%02X:%02X:%02X:%02X", bd_addr->b[0],
-						bd_addr->b[1], bd_addr->b[2], bd_addr->b[3],
-						bd_addr->b[4], bd_addr->b[5]);
+
+				UIM_VER(" BD address changed to %s", uim_bd_address);
 			}
 #ifdef UIM_DEBUG
-			read_firmware_version(dev_fd);
+			read_firmware_version();
 #endif
 		}
 
 		/* After the UART speed has been changed, the IOCTL is
 		 * is called to set the line discipline to N_TI_WL
 		 */
-		ldisc = N_TI_WL;
+		ldisc = 22;
 		if (ioctl(dev_fd, TIOCSETD, &ldisc) < 0) {
 			UIM_ERR(" Can't set line discipline");
-			close(dev_fd);
+			cleanup(-1);
 			return -1;
 		}
-		UIM_DBG("Installed N_TI_WL Line displine");
-	} else {
-		UIM_DBG("Un-Installed N_TI_WL Line displine");
+		UIM_DBG(" Installed N_TI_WL Line displine");
+	}
+	else {
+		UIM_DBG(" Un-Installed N_TI_WL Line displine");
 		/* UNINSTALL_N_TI_WL - When the Signal is received from KIM */
 		/* closing UART fd */
-		close(dev_fd);
+		cleanup(0);
+		dev_fd = -1;
 	}
 	return 0;
+}
+
+int remove_modules()
+{
+	int err = 0;
+
+#ifdef ANDROID
+	UIM_VER(" Removing gps_drv ");
+	if (rmmod("gps_drv") != 0) {
+		UIM_ERR(" Error removing gps_drv module");
+		err = -1;
+	} else {
+		UIM_DBG(" Removed gps_drv module");
+	}
+
+	UIM_VER(" Removing fm_drv ");
+	if (rmmod("fm_drv") != 0) {
+		UIM_ERR(" Error removing fm_drv module");
+		err = -1;
+	} else {
+		UIM_DBG(" Removed fm_drv module");
+	}
+	UIM_DBG(" Removed fm_drv module");
+
+	UIM_VER(" Removing btwilink ");
+	if (rmmod("btwilink") != 0) {
+		UIM_ERR(" Error removing btwilink module");
+		err = -1;
+	} else {
+		UIM_DBG(" Removed btwilink module");
+	}
+	UIM_DBG(" Removed btwilink module");
+
+	/*Remove the Shared Transport */
+	UIM_VER(" Removing st_drv ");
+	if (rmmod("st_drv") != 0) {
+		UIM_ERR(" Error removing st_drv module");
+		err = -1;
+	} else {
+		UIM_DBG(" Removed st_drv module ");
+	}
+	UIM_DBG(" Removed st_drv module ");
+#else
+	UIM_VER(" Removing btwilink ");
+	if (system("rmmod btwilink") != 0) {
+		UIM_ERR(" Error removing btwilink module");
+		err = -1;
+	} else {
+		UIM_DBG(" Removed btwilink module");
+	}
+
+	UIM_VER(" Removing fm_drv ");
+	if (system("rmmod fm_drv") != 0) {
+		UIM_ERR(" Error removing fm_drv module");
+		err = -1;
+	} else {
+		UIM_DBG(" Removed fm_drv module ");
+	}
+
+	/*Remove the Shared Transport */
+	UIM_VER(" Removing st_drv ");
+	if (system("rmmod st_drv") != 0) {
+		UIM_ERR(" Error removing st_drv module");
+		err = -1;
+	} else {
+		UIM_DBG(" Removed st_drv module ");
+	}
+#endif
+	return err;
+}
+
+int change_rfkill_perms(void)
+{
+	int fd, id, sz;
+	char path[64];
+	char buf[16];
+	for (id = 0; id < 50; id++) {
+		snprintf(path, sizeof(path), "/sys/class/rfkill/rfkill%d/type", id);
+		fd = open(path, O_RDONLY);
+		if (fd < 0) {
+			UIM_DBG("open(%s) failed: %s (%d)\n", path, strerror(errno), errno);
+			continue;
+		}
+		sz = read(fd, &buf, sizeof(buf));
+		close(fd);
+		if (sz >= 9 && memcmp(buf, "bluetooth", 9) == 0) {
+			UIM_DBG("found bluetooth rfkill entry @ %d\n", id);
+			break;
+		}
+	}
+	if (id == 50) {
+		return -1;
+	}
+#ifdef ANDROID
+	sprintf(path, "/sys/class/rfkill/rfkill%d/state", id);
+	sz = chown(path, AID_BLUETOOTH, AID_BLUETOOTH);
+	if (sz < 0) {
+		UIM_ERR("change mode failed for %s (%d)\n", path, errno);
+		return -1;
+	}
+#endif
+	/*
+	 * bluetooth group's user system needs write permission
+	 */
+	sz = chmod(path, 0660);
+	if (sz < 0) {
+		UIM_ERR("change mode failed for %s (%d)\n", path, errno);
+		return -1;
+	}
+	UIM_DBG("changed permissions for %s(%d) \n", path, sz);
+	/* end of change_perms */
+
+	return 0;
+}
+
+void *bt_malloc(size_t size)
+{
+	return malloc(size);
 }
 
 /* Function to convert the BD address from ascii to hex value */
 bdaddr_t *strtoba(const char *str)
 {
-	uint8_t *ba = malloc(sizeof(bdaddr_t));
-	unsigned int tmp_bd[BD_ADDR_BIN_LEN];
+	const char *ptr = str;
 	int i;
 
+	uint8_t *ba = bt_malloc(sizeof(bdaddr_t));
+	if (!ba)
+		return NULL;
 
-	if (ba) {
-		memset(tmp_bd, 0, BD_ADDR_BIN_LEN);
-		if (sscanf(str, "%02X:%02X:%02X:%02X:%02X:%02X",
-				&tmp_bd[0], &tmp_bd[1], &tmp_bd[2],
-				&tmp_bd[3], &tmp_bd[4], &tmp_bd[5]) != sizeof(bdaddr_t)) {
-			free (ba);
-			ba = NULL;
-			goto exit;
-		}
-		for (i=0;i<BD_ADDR_BIN_LEN;i++){
-			if(tmp_bd[i] > 255){
-				free (ba);
-				ba = NULL;
-				goto exit;
-			}
-			ba[i] = (uint8_t) tmp_bd[i];
-		}
-
+	for (i = 0; i < 6; i++) {
+		ba[i] = (uint8_t) strtol(ptr, NULL, 16);
+		if (i != 5 && !(ptr = strchr(ptr, ':')))
+			ptr = ":00:00:00:00:00";
+		ptr++;
 	}
-exit:
+
 	return (bdaddr_t *) ba;
 }
 
 /*****************************************************************************/
 int main(int argc, char *argv[])
 {
-	int st_fd, err;
-	unsigned char install, previous;
-	struct pollfd p;
-	unsigned int i;
-	/* List of invalid BD addresses */
-	const bdaddr_t bd_address_ignored[] = {
-			{ { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 } },
-			{ { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF } } };
+	int st_fd,err;
+	struct stat file_stat;
+#ifndef ANDROID        /* used on ubuntu */
+	char *tist_ko_path;
+	struct utsname name;
+#endif
+	struct pollfd   p;
+	unsigned char install;
 
 	UIM_START_FUNC();
-	bd_addr = NULL;
 	err = 0;
 
 	/* Parse the user input */
-	if ((argc > 2)) {
-		UIM_ERR("Invalid arguments");
-		UIM_ERR("Usage: uim <bd address>");
+	if (argc == 2) {
+		memset(&uim_bd_address, 0, sizeof(uim_bd_address));
+		/* BD address passed as string in xx:xx:xx:xx:xx:xx format */
+		strcpy(uim_bd_address, argv[1]);
+		bd_addr = strtoba(uim_bd_address);
+	} else if (argc != 1) {
+		UIM_ERR(" Invalid arguements");
+		UIM_ERR(" Usage: uim <bd address>");
 		return -1;
 	}
-	if (argc == 2) {
-		if (strlen(argv[1]) != BD_ADDR_LEN) {
-			UIM_ERR("Usage: uim XX:XX:XX:XX:XX:XX");
+
+#ifndef ANDROID
+	if (uname (&name) == -1) {
+		UIM_ERR("cannot get kernel release name");
+		return -1;
+	}
+#else  /* if ANDROID */
+
+	if (0 == lstat("/st_drv.ko", &file_stat)) {
+		if (insmod("/st_drv.ko", "") < 0) {
+			UIM_ERR(" Error inserting st_drv module");
+			return -1;
+		} else {
+			UIM_DBG(" Inserted st_drv module");
+		}
+	} else {
+		if (0 == lstat(INSTALL_SYSFS_ENTRY, &file_stat)) {
+			UIM_DBG("ST built into the kernel ?");
+		} else {
+			UIM_ERR("BT/FM/GPS would be unavailable on system");
 			return -1;
 		}
-		/* BD address passed as string in xx:xx:xx:xx:xx:xx format */
-		strncpy(uim_bd_address, argv[1], BD_ADDR_LEN+1);
-		bd_addr = strtoba(uim_bd_address);
 	}
 
-	if (bd_addr) {
-		/* Check if read value has to be ignored */
-		for (i = 0; i < (sizeof(bd_address_ignored) / sizeof(bdaddr_t)); i++) {
-
-			if (memcmp(&bd_address_ignored[i], bd_addr, sizeof(bdaddr_t)) == 0) {
-
-				UIM_DBG("Stored value "
-						"%02X:%02X:%02X:%02X:%02X:%02X was ignored",
-						bd_addr->b[0], bd_addr->b[1], bd_addr->b[2],
-						bd_addr->b[3], bd_addr->b[4], bd_addr->b[5]);
-				UIM_DBG("Using default chip bd address");
-
-				free(bd_addr);
-				bd_addr = NULL;
-
-				break;
-			}
+	if (0 == lstat("/btwilink.ko", &file_stat)) {
+		if (insmod("/btwilink.ko", "") < 0) {
+			UIM_ERR(" Error inserting btwilink module, NO BT? ");
+		} else {
+			UIM_DBG(" Inserted btwilink module");
 		}
-		if (bd_addr)
-			UIM_DBG("Using %s bd address", uim_bd_address);
-	} else
-		UIM_DBG("Using default chip bd address");
+	} else {
+		UIM_DBG("BT driver module un-available... ");
+		UIM_DBG("BT driver built into the kernel ?");
+	}
 
-	line_discipline = N_TI_WL;
+	if (0 == lstat("/fm_drv.ko", &file_stat)) {
+		if (insmod("/fm_drv.ko", "") < 0) {
+			UIM_ERR(" Error inserting fm_drv module, NO FM? ");
+		} else {
+			UIM_DBG(" Inserted fm_drv module");
+		}
+	} else {
+		UIM_DBG("FM driver module un-available... ");
+		UIM_DBG("FM driver built into the kernel ?");
+	}
 
+	if (0 == lstat("/gps_drv.ko", &file_stat)) {
+		if (insmod("/gps_drv.ko", "") < 0) {
+			UIM_ERR(" Error inserting gps_drv module, NO GPS? ");
+		} else {
+			UIM_DBG(" Inserted gps_drv module");
+		}
+	} else {
+		UIM_DBG("GPS driver module un-available... ");
+		UIM_DBG("GPS driver built into the kernel ?");
+	}
+
+	if (0 == lstat("/fm_v4l2_drv.ko", &file_stat)) {
+		if (insmod("/fm_v4l2_drv.ko", "") < 0) {
+			UIM_ERR(" Error inserting fm_v4l2_drv module, NO FM? ");
+		} else {
+			UIM_DBG(" Inserted fm_v4l2_drv module");
+		}
+	} else {
+		UIM_DBG("FM V4L2 driver module un-available... ");
+		UIM_DBG("FM V4L2 driver built into the kernel ?");
+	}
+	/* Change the permissions for v4l2 Fm device node */
+	if ((0 == lstat("/dev/radio0", &file_stat)) && chmod("/dev/radio0", 0666) < 0) {
+		UIM_ERR("unable to chmod /dev/radio0, might not exist");
+	}
+	if ((0 == lstat("/dev/tifm", &file_stat)) && chmod("/dev/tifm", 0666) < 0) {
+		UIM_ERR("unable to chmod /dev/tifm, might not exist");
+	}
+	/* change rfkill perms after insertion of BT driver which asks
+	 * the Bluetooth sub-system to create the rfkill device of type
+	 * "bluetooth"
+	 */
+	if (change_rfkill_perms() < 0) {
+		/* possible error condition */
+		UIM_ERR("rfkill not enabled in st_drv - BT on from UI might fail\n");
+	}
+
+#endif /* ANDROID */
+	/* rfkill device's open/poll/read */
 	st_fd = open(INSTALL_SYSFS_ENTRY, O_RDONLY);
 	if (st_fd < 0) {
-		UIM_DBG("unable to open %s(%s)", INSTALL_SYSFS_ENTRY, strerror(errno));
+		UIM_DBG("unable to open %s (%s)", INSTALL_SYSFS_ENTRY,
+				strerror(errno));
+		remove_modules();
 		return -1;
-	}
-
-	/* read to start proper poll */
-	err = read(st_fd, &install, 1);
-	/* special case where bluetoothd starts before the UIM, and UIM
-	 * needs to turn on bluetooth because of that.
-	 */
-	if ((err > 0) && install == '1') {
-		UIM_DBG("install set previously...");
-		st_uart_config(install);
 	}
 
 RE_POLL:
-
-	UIM_DBG("begin polling...");
+	err = read(st_fd, &install, 1);
+	if ((err > 0) && (install == '1')) {
+		UIM_DBG("install already set");
+		st_uart_config(install);
+	}
 
 	memset(&p, 0, sizeof(p));
 	p.fd = st_fd;
-	p.events = POLLERR | POLLPRI;
+	/* sysfs entries can only break poll for following events */
+	p.events = POLLERR | POLLHUP;
 
 	while (!exiting) {
 		p.revents = 0;
 		err = poll(&p, 1, -1);
-		UIM_DBG("poll broke due to event %d(PRI:%d/ERR:%d)\n", p.revents, POLLPRI, POLLERR);
 		if (err < 0 && errno == EINTR)
 			continue;
 		if (err)
@@ -579,26 +800,29 @@ RE_POLL:
 	close(st_fd);
 	st_fd = open(INSTALL_SYSFS_ENTRY, O_RDONLY);
 	if (st_fd < 0) {
-		UIM_DBG("unable to open %s (%s)", INSTALL_SYSFS_ENTRY, strerror(errno));
+		UIM_ERR("re-opening %s failed: %s", INSTALL_SYSFS_ENTRY,
+		strerror(errno));
 		return -1;
 	}
 
-	if (!exiting) {
-		previous = install;
+	if (!exiting)
+	{
 		err = read(st_fd, &install, 1);
-		UIM_DBG("read %c from install (previously was %c)\n", install, previous);
-		if (err > 0)
-			if (previous != install)
-				st_uart_config(install);
-			else
-				UIM_DBG("lost install event, retry later");
-
+		if (err <= 0) {
+			UIM_ERR("reading %s failed: %s", INSTALL_SYSFS_ENTRY,
+					strerror(errno));
+			goto RE_POLL;
+		}
+		st_uart_config(install);
 		goto RE_POLL;
 	}
 
+	if(remove_modules() < 0) {
+		UIM_ERR(" Error removing modules ");
+		close(st_fd);
+		return -1;
+	}
+
 	close(st_fd);
-	/* Free resources */
-	if (bd_addr)
-		free(bd_addr);
 	return 0;
 }
