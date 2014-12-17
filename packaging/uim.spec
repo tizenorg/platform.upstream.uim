@@ -16,7 +16,7 @@ User Mode Init manager for tiwl1283
 cp %{SOURCE1001} .
 
 %build
-gcc -o uim uim.c
+gcc ${CFLAGS} -o uim uim.c
 
 %install
 mkdir -p %{buildroot}/bin/
